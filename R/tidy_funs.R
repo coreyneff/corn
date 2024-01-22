@@ -33,6 +33,21 @@ align_vectors <- function(x, y, expand=TRUE) {
     return(list(x=x[common], y=y[common]))
 }
 
+age_categorizer <- function(ages, groups, labels = NULL){
+  if(is.null(labels)) {
+    labels <- vector("character", length = length(groups))
+    for(group in seq_along(groups)) {
+      labels[group] <- ifelse(group == length(groups), paste0(groups[group], "+ years"), paste0(groups[group], "-", groups[group+1]-1, " years"))
+    }
+  } else if (length(labels) != length(groups)){
+    stop("Length of groups and labels must be the same.")
+  }
+  out <- cut(ages, groups, right = T, include.lowest = T, ordered_result = T, labels = labels)
+  return(out)
+}
+
+age_categorizer(ages = 1:150, groups = )
+
 format_table <- function(xtab, percent = NULL, decimals = 1) {
   if(!is.table(xtab)) stop("Must pass a table object.")
 

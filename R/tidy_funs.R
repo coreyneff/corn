@@ -3,7 +3,36 @@ pluck_value <- function(x, field) {
 }
 
 add_commas <- function(num) {
-  format(numbers, big.mark=",", scientific=FALSE, trim=TRUE)
+  format(num, big.mark=",", scientific=FALSE, trim=TRUE)
+}
+
+format_table <- function(xtab, percent = NULL, decimals = 1) {
+  if(!is.table(xtab)) stop("Must pass a table object.")
+
+  rowsums <- rowSums(xtab)
+  colsums <- colSums(xtab)
+  total <- sum(xtab)
+  out <- xtab
+  class(out) <- "character"
+
+  if(!is.null(percent)){
+    if(percent == "row") {
+      for(row in 1:(nrow(out))){
+        out[row,] = paste0(add_commas(xtab[row,]), " (", 100*round(xtab[row,]/rowsums[row], digits = decimals), "%)")
+      }
+    } else if (percent == "col") {
+      for(col in 1:(ncol(out))){
+        out[,col] = paste0(add_commas(xtab[,col]), " (", 100*round(xtab[,col]/colsums[col], digits = decimals), "%)")
+      }
+    } else if (percent == "total") {
+      for(col in 1:(ncol(out))){
+        out[,col] = paste0(add_commas(xtab[,col]), " (", 100*round(xtab[,col]/total, digits = decimals), "%)")
+      }
+    }
+  }
+  out <- cbind(out, Total = add_commas(colsums))
+  out <- rbind(out, Total = add_commas(c(rowsums, total)))
+  return(out)
 }
 
 align_vectors <- function(x, y, expand=TRUE) {

@@ -1,4 +1,4 @@
-pluck_value <- function(x, field) {
+pluck_index<- function(x, field) {
   lapply(x, "[[", field)
 }
 
@@ -210,6 +210,26 @@ get_crayon <- function(colors=NULL)  {
     names(result)[is.na(g)] <- colors[is.na(g)]
 
     return(result)
+}
+
+spell_out <- function(number, capitalize=FALSE, max_value=9) {
+  origin = number
+
+  ones = list(zero=0, one=1, two=2, three=3, four=4, five=5,
+              six=6, seven=7, eight=8, nine=9)
+  teens = list(eleven=11, twelve=12, thirteen=13, fourteen=14, fifteen=15,
+               sixteen=16, seventeen=17, eighteen=18, nineteen=19)
+  tens = list(ten=10, twenty=20, thirty=30, forty=40, fifty=50,
+              sixty=60, seventy=70, eighty=80, ninety=90)
+  large_digits = list(hundred=100, thousand=1000, million=1e6, billion=1e9, trillion=1e12)
+  double_digits = c(teens,tens)
+
+  #Split the string into words
+  string=gsub("-"," ",gsub(" & ", " and ",string,ignore.case=T))
+  string=numberTypes(string)
+  wrdsplit=strsplit(tolower(string)," ")[[1]]
+  wrdsplit=wrdsplit[wrdsplit!=""]
+  isNumber=apply(data.frame(wrdsplit),1,isNumericWord)
 }
 
 forest_plot <- function(estimate, lci, uci, labels = NULL, rotate = FALSE) {

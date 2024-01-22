@@ -6,6 +6,33 @@ add_commas <- function(num) {
   format(num, big.mark=",", scientific=FALSE, trim=TRUE)
 }
 
+align_vectors <- function(x, y, expand=TRUE) {
+    nx <- names(x)
+    ny <- names(y)
+    if(is.null(nx) || is.null(ny))
+      stop("Need names attributes for both x and y")
+
+    if(length(unique(nx)) != length(nx))
+      stop("names(x) not all distinct")
+    if(length(unique(ny)) != length(ny))
+      stop("names(y) not all distinct")
+
+    if(expand) {
+      nfull <- unique(c(nx, ny))
+      if(any(!(nfull %in% nx)))
+        x <- c(x, setNames(rep(NA, length(nfull)-length(nx)),
+                           nfull[!(nfull %in% nx)]))
+      if(any(!(nfull %in% ny)))
+        y <- c(y, setNames(rep(NA, length(nfull)-length(ny)),
+                           nfull[!(nfull %in% ny)]))
+    }
+
+    nx <- names(x)
+    ny <- names(y)
+    common <- nx[nx %in% ny]
+    return(list(x=x[common], y=y[common]))
+}
+
 format_table <- function(xtab, percent = NULL, decimals = 1) {
   if(!is.table(xtab)) stop("Must pass a table object.")
 
@@ -159,12 +186,10 @@ ci_plot <- function(est, se=NULL, lo=NULL, hi=NULL, SEmult=2, labels=NULL, rotat
     invisible()
 }
 
-get_crayon <- function(colors=NULL, ...)  {
+get_crayon <- function(colors=NULL)  {
     if(is.null(colors)) return(crayons)
 
-    dots <- list(...)
-    colors <- unlist(c(colors,dots))
-
+    colors <- unlist(colors)
     allnames <- names(crayons)
     m <- match(colors, allnames)
     notfound <- colors[is.na(m)]
@@ -184,7 +209,7 @@ get_crayon <- function(colors=NULL, ...)  {
     result <- crayons[g]
     names(result)[is.na(g)] <- colors[is.na(g)]
 
-    result
+    return(result)
 }
 
 forest_plot <- function(estimate, lci, uci, labels = NULL, rotate = FALSE) {

@@ -19,12 +19,8 @@ align_vectors <- function(x, y, expand=TRUE) {
 
     if(expand) {
       nfull <- unique(c(nx, ny))
-      if(any(!(nfull %in% nx)))
-        x <- c(x, setNames(rep(NA, length(nfull)-length(nx)),
-                           nfull[!(nfull %in% nx)]))
-      if(any(!(nfull %in% ny)))
-        y <- c(y, setNames(rep(NA, length(nfull)-length(ny)),
-                           nfull[!(nfull %in% ny)]))
+      if(any(!(nfull %in% nx)))  x <- c(x, setNames(rep(NA, length(nfull)-length(nx)), nfull[!(nfull %in% nx)]))
+      if(any(!(nfull %in% ny)))  y <- c(y, setNames(rep(NA, length(nfull)-length(ny)), nfull[!(nfull %in% ny)]))
     }
 
     nx <- names(x)
@@ -42,11 +38,10 @@ age_categorizer <- function(ages, groups, labels = NULL){
   } else if (length(labels) != length(groups)){
     stop("Length of groups and labels must be the same.")
   }
-  out <- cut(ages, groups, right = T, include.lowest = T, ordered_result = T, labels = labels)
+
+  out <- cut(ages, c(groups, Inf), right = T, include.lowest = T, ordered_result = T, labels = labels)
   return(out)
 }
-
-age_categorizer(ages = 1:150, groups = )
 
 format_table <- function(xtab, percent = NULL, decimals = 1) {
   if(!is.table(xtab)) stop("Must pass a table object.")

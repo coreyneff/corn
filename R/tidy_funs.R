@@ -1,11 +1,3 @@
-pluck_index<- function(x, field) {
-  lapply(x, "[[", field)
-}
-
-add_commas <- function(num) {
-  format(num, big.mark=",", scientific=FALSE, trim=TRUE)
-}
-
 align_vectors <- function(x, y, expand=TRUE) {
     nx <- names(x)
     ny <- names(y)
@@ -29,18 +21,117 @@ align_vectors <- function(x, y, expand=TRUE) {
     return(list(x=x[common], y=y[common]))
 }
 
-age_categorizer <- function(ages, groups, labels = NULL){
-  if(is.null(labels)) {
-    labels <- vector("character", length = length(groups))
-    for(group in seq_along(groups)) {
-      labels[group] <- ifelse(group == length(groups), paste0(groups[group], "+ years"), paste0(groups[group], "-", groups[group+1]-1, " years"))
-    }
-  } else if (length(labels) != length(groups)){
-    stop("Length of groups and labels must be the same.")
+categorize_ages <- function(ages, ranges, labels = NULL, ordered = TRUE) {
+  if (!is.numeric(ages)) {
+    stop("`ages` must be a numeric vector.")
   }
 
-  out <- cut(ages, c(groups, Inf), right = T, include.lowest = T, ordered_result = T, labels = labels)
-  return(out)
+  parse_character_range <- function(x) {
+    x_clean <- gsub("\\s+", "", x)
+
+    range_pattern <- "^[0-9]+(?:\\.[0-9]+)?-[0-9]+(?:\\.[0-9]+)?$"
+    plus_pattern  <- "^[0-9]+(?:\\.[0-9]+)?\\+$"
+
+    if (grepl(range_pattern, x_clean, perl = TRUE)) {
+      parts <- strsplit(x_clean, "-", fixed = TRUE)[[1]]
+      lower <- as.numeric(parts[1])
+      upper <- as.numeric(parts[2])
+    } else if (grepl(plus_pattern, x_clean, perl = TRUE)) {
+      lower <- as.numeric(sub("\\+$", "", x_clean))
+      upper <- Inf
+    } else {
+      stop(
+        "Invalid character range: ", x,
+        ". Use formats like '1-30', '31-50', or '51+'."
+      )
+    }
+
+    if (lower > upper) {
+      stop("Invalid range: ", x, ". Lower bound is greater than upper bound.")
+    }
+
+    c(lower = lower, upper = upper)
+  }
+
+  parse_numeric_range <- function(x) {
+    if (!is.numeric(x) || length(x) == 0) {
+      stop("Each numeric range must be a non-empty numeric vector.")
+    }
+
+    if (anyNA(x)) {
+      stop("Numeric ranges cannot contain NA.")
+    }
+
+    lower <- min(x)
+    upper <- max(x)
+
+    if (lower > upper) {
+      stop("Invalid numeric range. Lower bound is greater than upper bound.")
+    }
+
+    c(lower = lower, upper = upper)
+  }
+
+  if (is.character(ranges)) {
+    bounds <- t(vapply(ranges, parse_character_range, numeric(2)))
+
+    if (is.null(labels)) {
+      labels <- ranges
+    }
+
+  } else if (is.list(ranges)) {
+    bounds <- t(vapply(ranges, parse_numeric_range, numeric(2)))
+
+    if (is.null(labels)) {
+      labels <- vapply(
+        seq_along(ranges),
+        function(i) {
+          lower <- bounds[i, "lower"]
+          upper <- bounds[i, "upper"]
+
+          if (is.infinite(upper)) {
+            paste0(lower, "+")
+          } else {
+            paste0(lower, "-", upper)
+          }
+        },
+        character(1)
+      )
+    }
+
+  } else {
+    stop(
+      "`ranges` must be either a character vector, e.g. c('1-30', '31-50', '51+'), ",
+      "or a list of numeric vectors, e.g. list(1:30, 31:50, c(51, Inf))."
+    )
+  }
+
+  if (length(labels) != nrow(bounds)) {
+    stop("`labels` must have the same length as `ranges`.")
+  }
+
+  ord <- order(bounds[, "lower"], bounds[, "upper"])
+  bounds <- bounds[ord, , drop = FALSE]
+  labels <- labels[ord]
+
+  if (nrow(bounds) > 1) {
+    overlaps <- bounds[-1, "lower"] <= bounds[-nrow(bounds), "upper"]
+
+    if (any(overlaps)) {
+      stop("Age ranges must not overlap.")
+    }
+  }
+
+  idx <- findInterval(ages, bounds[, "lower"])
+
+  out <- rep(NA_character_, length(ages))
+
+  candidates <- which(!is.na(ages) & idx > 0)
+  matches <- candidates[ages[candidates] <= bounds[idx[candidates], "upper"]]
+
+  out[matches] <- labels[idx[matches]]
+
+  factor(out, levels = labels, ordered = ordered)
 }
 
 format_table <- function(xtab, percent = NULL, decimals = 1) {

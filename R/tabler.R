@@ -412,3 +412,127 @@ tabler <- function(data, ...,
   row.names(out) <- NULL
   out
 }
+
+bivariate_tabler <- function(data, variable_name, by, fill_p = T) {
+    variable_data = data[, c(variable_name, by)]
+    valid <- sum(!is.na(variable_data[[variable_name]]))
+    categorical = ifelse(is.factor(variable_data[[variable_name]]) || is.character(variable_data[[variable_name]]), T, F)
+    variable_data = drop_na(variable_data)
+    if(valid == 0) return(NULL)
+    if(categorical){
+        table <- table(variable_data)
+        possible_chisq.test <- possibly(.f = chisq.test, otherwise = NULL)
+        possible_fisher.test <- possibly(.f = fisher.test, otherwise = NULL)
+        chisq_test <- possible_chisq.test(table, simulate.p.value = F)
+        fisher_test <- possible_fisher.test(table, simulate.p.value = T)
+        pvalue <- case_when(
+            !is.na(chisq_test$p.value) ~ pvalue(chisq_test$p.value, accuracy = 0.001), 
+            !is.na(fisher_test$p.value) ~ pvalue(fisher_test$p.value, accuracy = 0.001), 
+            T ~ "Unable to calculate")
+        bottom <- cbind(Total = rowSums(table, na.rm = T), as.data.frame.matrix(table))
+        top <- as.data.frame.list(colSums(bottom)) %>%
+            rename_with(~str_replace_all(.x, "\\.", " ")) %>%
+            rename_with(~paste(.x, "N")) %>%
+            mutate(Variable = variable_name, Response = "Valid N", .before = 1)
+        # bottom <- rbind(`Valid N` = colSums(bottom, na.rm = T), bottom)
+        names(bottom) <- paste0(names(bottom), " N")
+        for(col in names(bottom)) {
+            bottom[[str_replace(col, " N", " Percent")]] <- percent(bottom[[col]]/sum(bottom[[col]]), accuracy = 0.01)
+            bottom <- relocate(bottom, any_of(str_replace(col, " N", " Percent")), .after = any_of(col))
+        }
+        bottom <- tibble::rownames_to_column(bottom, "Response")
+        
+        out <- bind_rows(top, bottom) %>%
+            select(Response, `Total N`, `Total Percent`, order(names(.))) %>%
+            mutate(Variable = variable_name, .before = 1) %>%
+            mutate(p = ifelse(Response == "Valid N", pvalue, NA_real_), .after = last_col()) %>%
+            mutate(across(everything(), as.character)) %>%
+            mutate(across(ends_with("Percent"), ~ifelse(.x == "0.00%", "--", .x)))
+    } else {
+        possible_oneway.test <- possibly(.f = oneway.test, otherwise = NULL)
+        test <- possible_oneway.test(as.formula(paste0(variable_name, "~", by)), data = na.omit(variable_data))
+        pvalue <- ifelse(is.null(test), "Unable to calculate", pvalue(test$p.value, accuracy = 0.001))
+        
+        overall <- bind_rows(
+            variable_data %>%
+                summarise(
+                    !!sym(by) := "Total",
+                    Response = "Valid N",
+                    N = valid),
+            variable_data %>%
+                group_by(!!sym(by)) %>%
+                summarise(Response = "Valid N",
+                    N = sum(!is.na(!!sym(variable_name))))) %>%
+            pivot_wider(names_from = !!sym(by), values_from = c(N)) %>%
+            mutate(across(everything(), as.character)) %>%
+            rename_with(~paste0("N_", .x), .cols = !Response)
+        
+        mean <-
+            bind_rows(
+                variable_data %>%
+                    summarise(
+                        !!sym(by) := "Total",
+                        Response = "Mean (SD)",
+                        N = sprintf("%.02f", mean(!!sym(variable_name), na.rm = T)),
+                        Percent  = sprintf("%.02f", sd(!!sym(variable_name), na.rm = T))),
+                variable_data %>%
+                    group_by(!!sym(by)) %>%
+                    summarise(Response = "Mean (SD)",
+                        N = sprintf("%.02f", mean(!!sym(variable_name), na.rm = T)),
+                        Percent  = sprintf("%.02f", sd(!!sym(variable_name), na.rm = T)))) %>%
+            pivot_wider(names_from = !!sym(by), values_from = c(N, Percent))
+        
+        median <- bind_rows(
+            variable_data %>%
+                summarise(
+                    !!sym(by) := "Total",
+                    Response = "Median (IQR)",
+                    N = sprintf("%.02f", median(!!sym(variable_name), na.rm = T)),
+                    Percent  = sprintf("%.02f", (IQR(!!sym(variable_name), na.rm = T)))),
+            variable_data %>%
+                group_by(!!sym(by)) %>%
+                summarise(
+                    Response = "Median (IQR)",
+                    N = sprintf("%.02f", median(!!sym(variable_name), na.rm = T)),
+                    Percent  = sprintf("%.02f", IQR(!!sym(variable_name), na.rm = T)))
+            ) %>%
+            pivot_wider(names_from = !!sym(by), values_from = c(N, Percent))
+        
+        range <- bind_rows(
+            variable_data %>%
+                summarise(
+                    !!sym(by) := "Total",
+                    Response = "Range (25th-75th)",
+                    N = paste0(range(!!sym(variable_name), na.rm = T), collapse = "-"),
+                    Percent  = paste0(round(quantile(!!sym(variable_name), probs = c(0.25, 0.75), na.rm = T), 1), collapse = "-")),
+            variable_data %>%
+                group_by(!!sym(by)) %>%
+                summarise(
+                    Response = "Range (25th-75th)",
+                    N = paste0(range(!!sym(variable_name), na.rm = T), collapse = "-"),
+                    Percent  = paste0(round(quantile(!!sym(variable_name), probs = c(0.25, 0.75), na.rm = T), 1), collapse = "-"))) %>%
+                pivot_wider(names_from = !!sym(by), values_from = c(N, Percent))
+        
+        out <-
+            bind_rows(overall, mean, median, range) %>%
+            rename_with(function(name) paste(str_replace(name, "^N_", ""), "N"), .cols = starts_with("N_")) %>%
+            rename_with(function(name) paste(str_replace(name, "^Percent_", ""), "Percent"), .cols = starts_with("Percent_")) %>%
+            mutate(
+                p = ifelse(Response == "Valid N", pvalue, NA_real_), .after = last_col(),
+                across(everything(), as.character),
+                Variable = variable_name
+            )
+            
+    }
+    order <- c("Overall", levels(variable_data[[by]]))
+    order <- unlist(map(order, ~paste(.x, c("N", "Percent"))))
+
+    rownames(out) <- NULL
+    out[nrow(out) + 1,] <- NA
+    if(fill_p) out <- fill(out, p, .direction = "down")
+    
+    Label <- var_label(variable_data[[variable_name]])
+    out$Label <- ifelse(is.null(Label), "", Label)
+
+    select(out, Variable, Label, Response, `Total N`, `Total Percent`, any_of(order), p)
+}

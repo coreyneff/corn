@@ -1,0 +1,950 @@
+# Refactored multivariable model runner
+#
+# Main improvements over the original version:
+#   * Fits each model once and reuses the fitted object for all summaries.
+#   * Captures errors, warnings, and messages for fitting, tidying, diagnostics, and emmeans.
+#   * Accepts one distribution for all outcomes, an outcome-named vector/list, or one per outcome.
+#   * Supports common model aliases: gaussian, binomial/logistic, poisson, quasipoisson,
+#     quasibinomial, Gamma, inverse.gaussian, negbin/negative.binomial, lm/ols,
+#     rlm, polr, multinom, coxph, and betareg when the needed package is installed.
+#   * Allows custom model fitters through `model_fitters`.
+#   * Handles formula terms such as interactions, scale(), poly(), offset(), and Surv().
+#   * Writes one workbook with Results, Fit_Statistics, Marginal_Means, and Run_Log sheets.
+#   * Returns all fitted models and tables invisibly for programmatic use.
+
+.required_pkgs_glm_multiple <- function(pkgs) {
+  missing <- pkgs[!vapply(pkgs, requireNamespace, quietly = TRUE, FUN.VALUE = logical(1))]
+  if (length(missing) > 0) {
+    stop(
+      "Install required package(s) before running glm_multiple(): ",
+      paste(missing, collapse = ", "),
+      call. = FALSE
+    )
+  }
+  invisible(TRUE)
+}
+
+.capture_conditions_glm_multiple <- function(expr) {
+  warnings <- character(0)
+  messages <- character(0)
+  error <- NULL
+
+  result <- tryCatch(
+    withCallingHandlers(
+      expr,
+      warning = function(w) {
+        warnings <<- c(warnings, conditionMessage(w))
+        invokeRestart("muffleWarning")
+      },
+      message = function(m) {
+        messages <<- c(messages, conditionMessage(m))
+        invokeRestart("muffleMessage")
+      }
+    ),
+    error = function(e) {
+      error <<- e
+      NULL
+    }
+  )
+
+  list(
+    result = result,
+    error = error,
+    warnings = unique(warnings),
+    messages = unique(messages)
+  )
+}
+
+.condition_text_glm_multiple <- function(x, none = "None") {
+  if (is.null(x)) return(none)
+  if (inherits(x, "condition")) return(conditionMessage(x))
+  x <- unique(stats::na.omit(as.character(x)))
+  if (length(x) == 0) return(none)
+  paste(seq_along(x), x, sep = ". ", collapse = "; ")
+}
+
+.backtick_if_needed_glm_multiple <- function(x) {
+  reserved <- c(
+    "if", "else", "repeat", "while", "function", "for", "in", "next", "break",
+    "TRUE", "FALSE", "NULL", "Inf", "NaN", "NA", "NA_integer_", "NA_real_",
+    "NA_complex_", "NA_character_"
+  )
+  syntactic <- grepl("^[.A-Za-z][.A-Za-z0-9_]*$", x) && !x %in% reserved
+  if (syntactic) return(x)
+  paste0("`", gsub("`", "\\\\`", x), "`")
+}
+
+.as_lhs_glm_multiple <- function(x, data_names) {
+  if (!is.character(x) || length(x) != 1 || is.na(x) || !nzchar(x)) {
+    stop("Each dependent/outcome must be a non-empty character scalar.", call. = FALSE)
+  }
+  if (x %in% data_names) return(.backtick_if_needed_glm_multiple(x))
+  x
+}
+
+.as_rhs_term_glm_multiple <- function(x, data_names) {
+  if (!is.character(x) || length(x) != 1 || is.na(x) || !nzchar(x)) {
+    stop("Each independent/covariate term must be a non-empty character scalar.", call. = FALSE)
+  }
+  if (x %in% data_names) return(.backtick_if_needed_glm_multiple(x))
+  x
+}
+
+.formula_text_glm_multiple <- function(formula) {
+  paste(deparse(formula, width.cutoff = 500L), collapse = "")
+}
+
+.vars_from_terms_glm_multiple <- function(terms) {
+  terms <- unique(stats::na.omit(as.character(terms)))
+  terms <- terms[nzchar(terms)]
+  if (length(terms) == 0) return(character(0))
+
+  out <- try(
+    all.vars(stats::as.formula(paste("~", paste(terms, collapse = " + ")))),
+    silent = TRUE
+  )
+  if (inherits(out, "try-error")) terms else unique(out)
+}
+
+.normalize_model_key_glm_multiple <- function(x) {
+  key <- tolower(trimws(as.character(x)))
+  key <- gsub("[-_ ]+", ".", key)
+  key <- gsub("[^a-z0-9.]+", "", key)
+
+  aliases <- c(
+    linear = "lm",
+    ols = "lm",
+    logit = "binomial",
+    logistic = "binomial",
+    logistic.regression = "binomial",
+    quasi.poisson = "quasipoisson",
+    quasi.binomial = "quasibinomial",
+    negative.binomial = "negbin",
+    negativebinomial = "negbin",
+    nb = "negbin",
+    nbinom = "negbin",
+    inverse.gaussian = "inverse.gaussian",
+    inversegaussian = "inverse.gaussian",
+    ordinal = "polr",
+    ordinal.logistic = "polr",
+    proportional.odds = "polr",
+    multinomial = "multinom",
+    multinomial.logistic = "multinom",
+    cox = "coxph",
+    cox.proportional.hazards = "coxph",
+    beta = "betareg",
+    beta.regression = "betareg"
+  )
+
+  if (key %in% names(aliases)) aliases[[key]] else key
+}
+
+.normalize_specs_glm_multiple <- function(distributions, dependents) {
+  n <- length(dependents)
+
+  if (is.null(distributions)) distributions <- "gaussian"
+
+  if (inherits(distributions, "family") || is.function(distributions)) {
+    specs <- list(distributions)
+  } else if (is.list(distributions)) {
+    specs <- distributions
+  } else {
+    specs <- as.list(distributions)
+  }
+
+  nm <- names(specs)
+  if (!is.null(nm) && all(nzchar(nm)) && all(dependents %in% nm)) {
+    specs <- specs[dependents]
+  } else if (length(specs) == 1L && n > 1L) {
+    specs <- rep(specs, n)
+  } else if (length(specs) != n) {
+    stop(
+      "`distributions` must have length 1, length equal to `dependents`, ",
+      "or be named by every dependent/outcome.",
+      call. = FALSE
+    )
+  }
+
+  names(specs) <- dependents
+  specs
+}
+
+.spec_label_glm_multiple <- function(spec) {
+  if (inherits(spec, "family")) {
+    return(paste0("glm:", spec$family, "(", spec$link, ")"))
+  }
+  if (is.function(spec)) return("custom_function")
+  if (is.character(spec) && length(spec) == 1L) return(.normalize_model_key_glm_multiple(spec))
+  paste(class(spec), collapse = "/")
+}
+
+.family_from_key_glm_multiple <- function(key) {
+  switch(
+    key,
+    gaussian = stats::gaussian(),
+    binomial = stats::binomial(),
+    poisson = stats::poisson(),
+    quasipoisson = stats::quasipoisson(),
+    quasibinomial = stats::quasibinomial(),
+    gamma = stats::Gamma(),
+    inverse.gaussian = stats::inverse.gaussian(),
+    stop("Unsupported GLM family: ", key, call. = FALSE)
+  )
+}
+
+.fit_model_glm_multiple <- function(formula, data, spec, na_action, model_fitters = NULL, ...) {
+  dots <- list(...)
+
+  call_with <- function(fun, defaults) {
+    do.call(fun, utils::modifyList(defaults, dots, keep.null = TRUE))
+  }
+
+  if (!is.null(model_fitters)) {
+    if (!is.list(model_fitters) || is.null(names(model_fitters)) || any(!nzchar(names(model_fitters)))) {
+      stop("`model_fitters` must be a named list of functions.", call. = FALSE)
+    }
+    fitter_names <- vapply(names(model_fitters), .normalize_model_key_glm_multiple, character(1))
+    names(model_fitters) <- fitter_names
+  }
+
+  defaults <- list(formula = formula, data = data, na.action = na_action)
+
+  if (inherits(spec, "family")) {
+    return(call_with(stats::glm, c(defaults, list(family = spec))))
+  }
+
+  if (is.function(spec)) {
+    possible_family <- try(spec(), silent = TRUE)
+    if (inherits(possible_family, "family")) {
+      return(call_with(stats::glm, c(defaults, list(family = possible_family))))
+    }
+    return(call_with(spec, defaults))
+  }
+
+  if (!is.character(spec) || length(spec) != 1L) {
+    stop("Each distribution/model spec must be a character scalar, family object, or function.", call. = FALSE)
+  }
+
+  key <- .normalize_model_key_glm_multiple(spec)
+
+  if (!is.null(model_fitters) && key %in% names(model_fitters)) {
+    return(call_with(model_fitters[[key]], defaults))
+  }
+
+  switch(
+    key,
+    lm = call_with(stats::lm, defaults),
+    gaussian = call_with(stats::glm, c(defaults, list(family = stats::gaussian()))),
+    binomial = call_with(stats::glm, c(defaults, list(family = stats::binomial()))),
+    poisson = call_with(stats::glm, c(defaults, list(family = stats::poisson()))),
+    quasipoisson = call_with(stats::glm, c(defaults, list(family = stats::quasipoisson()))),
+    quasibinomial = call_with(stats::glm, c(defaults, list(family = stats::quasibinomial()))),
+    gamma = call_with(stats::glm, c(defaults, list(family = stats::Gamma()))),
+    inverse.gaussian = call_with(stats::glm, c(defaults, list(family = stats::inverse.gaussian()))),
+    negbin = {
+      .required_pkgs_glm_multiple("MASS")
+      call_with(MASS::glm.nb, defaults)
+    },
+    rlm = {
+      .required_pkgs_glm_multiple("MASS")
+      call_with(MASS::rlm, defaults)
+    },
+    polr = {
+      .required_pkgs_glm_multiple("MASS")
+      call_with(MASS::polr, c(defaults, list(Hess = TRUE)))
+    },
+    multinom = {
+      .required_pkgs_glm_multiple("nnet")
+      call_with(nnet::multinom, c(defaults, list(trace = FALSE)))
+    },
+    coxph = {
+      .required_pkgs_glm_multiple("survival")
+      call_with(survival::coxph, defaults)
+    },
+    betareg = {
+      .required_pkgs_glm_multiple("betareg")
+      call_with(betareg::betareg, defaults)
+    },
+    stop(
+      "Unsupported distribution/model type: `", spec, "`. ",
+      "Use a supported key or supply a custom fitter in `model_fitters`.",
+      call. = FALSE
+    )
+  )
+}
+
+.term_map_glm_multiple <- function(model) {
+  out <- try({
+    mm <- stats::model.matrix(model)
+    assign <- attr(mm, "assign")
+    labels <- c("(Intercept)", attr(stats::terms(model), "term.labels"))
+    data.frame(
+      term = colnames(mm),
+      model_term = labels[assign + 1L],
+      stringsAsFactors = FALSE
+    )
+  }, silent = TRUE)
+
+  if (inherits(out, "try-error")) {
+    data.frame(term = character(0), model_term = character(0), stringsAsFactors = FALSE)
+  } else {
+    out
+  }
+}
+
+.default_exponentiate_glm_multiple <- function(model) {
+  if (inherits(model, "coxph")) return(TRUE)
+  if (inherits(model, "polr")) return(TRUE)
+  if (inherits(model, "multinom")) return(TRUE)
+  if (inherits(model, "glm") && !is.null(model$family$link)) {
+    return(model$family$link %in% c("log", "logit", "cloglog"))
+  }
+  FALSE
+}
+
+.exponentiate_for_outcome_glm_multiple <- function(exponentiate, outcome, index, model) {
+  if (is.null(exponentiate)) return(.default_exponentiate_glm_multiple(model))
+
+  if (!is.null(names(exponentiate)) && outcome %in% names(exponentiate)) {
+    return(isTRUE(exponentiate[[outcome]]))
+  }
+  if (length(exponentiate) == 1L) return(isTRUE(exponentiate[[1L]]))
+  if (length(exponentiate) >= index) return(isTRUE(exponentiate[[index]]))
+
+  stop("`exponentiate` must be length 1, length equal to `dependents`, or named by outcome.", call. = FALSE)
+}
+
+.estimate_label_glm_multiple <- function(model, exponentiate) {
+  if (!isTRUE(exponentiate)) return("Coefficient")
+  if (inherits(model, "coxph")) return("Hazard Ratio")
+  if (inherits(model, "glm") && !is.null(model$family$family)) {
+    fam <- tolower(model$family$family)
+    link <- tolower(model$family$link)
+    if (fam == "binomial" && link %in% c("logit", "cloglog")) return("Odds/Relative Odds Ratio")
+    if (fam %in% c("poisson", "quasipoisson", "negative binomial") && link == "log") return("Rate Ratio")
+    if (link == "log") return("Ratio")
+  }
+  "Exponentiated Coefficient"
+}
+
+.get_col_glm_multiple <- function(x, nm, default = NA_real_) {
+  if (nm %in% names(x)) return(x[[nm]])
+  rep(default, nrow(x))
+}
+
+.format_number_glm_multiple <- function(x, accuracy) {
+  if (is.null(accuracy)) return(x)
+  if (!is.numeric(x)) return(x)
+  if ("number" %in% getNamespaceExports("scales")) {
+    return(scales::number(x, accuracy = accuracy))
+  }
+  scales::number_format(accuracy = accuracy)(x)
+}
+
+.format_p_glm_multiple <- function(x, accuracy) {
+  if (is.null(accuracy)) return(x)
+  if (!is.numeric(x)) return(x)
+  if ("pvalue" %in% getNamespaceExports("scales")) {
+    return(scales::pvalue(x, accuracy = accuracy, add_p = FALSE))
+  }
+  scales::pvalue_format(accuracy = accuracy, add_p = FALSE)(x)
+}
+
+.tidy_model_glm_multiple <- function(model, outcome, model_label, focus_terms, focus_vars,
+                                     fit_warnings, fit_messages, conf.level,
+                                     exponentiate, num_format, p_format) {
+  tidy_try <- .capture_conditions_glm_multiple(
+    broom::tidy(model, conf.int = TRUE, conf.level = conf.level, exponentiate = exponentiate)
+  )
+
+  if (!is.null(tidy_try$error)) {
+    tidy_try_2 <- .capture_conditions_glm_multiple(
+      broom::tidy(model, conf.int = FALSE, exponentiate = exponentiate)
+    )
+    if (!is.null(tidy_try_2$error)) {
+      return(list(
+        table = tibble::tibble(
+          Outcome = outcome,
+          Model = model_label,
+          Status = "tidy_error",
+          Error = .condition_text_glm_multiple(tidy_try_2$error)
+        ),
+        warnings = c(tidy_try$warnings, tidy_try_2$warnings),
+        messages = c(tidy_try$messages, tidy_try_2$messages),
+        error = tidy_try_2$error
+      ))
+    }
+    tidy_try <- tidy_try_2
+  }
+
+  tidy_tbl <- tibble::as_tibble(tidy_try$result)
+  if (!("term" %in% names(tidy_tbl))) {
+    tidy_tbl$term <- paste0("term_", seq_len(nrow(tidy_tbl)))
+  }
+
+  term_map <- .term_map_glm_multiple(model)
+  if (nrow(term_map) > 0) {
+    tidy_tbl <- dplyr::left_join(tidy_tbl, term_map, by = "term")
+  } else {
+    tidy_tbl$model_term <- NA_character_
+  }
+
+  term <- as.character(.get_col_glm_multiple(tidy_tbl, "term", NA_character_))
+  model_term <- as.character(.get_col_glm_multiple(tidy_tbl, "model_term", NA_character_))
+  predictor <- ifelse(is.na(model_term) | !nzchar(model_term), term, model_term)
+
+  result <- tibble::tibble(
+    Outcome = outcome,
+    Model = model_label,
+    N = suppressWarnings(tryCatch(stats::nobs(model), error = function(e) NA_integer_)),
+    Predictor = predictor,
+    Term = term,
+    Estimate_Type = .estimate_label_glm_multiple(model, exponentiate),
+    Estimate = .get_col_glm_multiple(tidy_tbl, "estimate"),
+    SE = .get_col_glm_multiple(tidy_tbl, "std.error"),
+    LCL = .get_col_glm_multiple(tidy_tbl, "conf.low"),
+    UCL = .get_col_glm_multiple(tidy_tbl, "conf.high"),
+    Statistic = .get_col_glm_multiple(tidy_tbl, "statistic"),
+    P = .get_col_glm_multiple(tidy_tbl, "p.value"),
+    Fit_Warnings = .condition_text_glm_multiple(fit_warnings),
+    Fit_Messages = .condition_text_glm_multiple(fit_messages),
+    Tidy_Warnings = .condition_text_glm_multiple(tidy_try$warnings),
+    Tidy_Messages = .condition_text_glm_multiple(tidy_try$messages)
+  )
+
+  result <- result[result$Term != "(Intercept)", , drop = FALSE]
+
+  if (length(focus_terms) > 0) {
+    # Use raw focus terms for exact formula-term matches, and use variable-level
+    # matching only when the focus term itself is a simple RHS variable. This
+    # avoids accidentally keeping disp and wt when the requested focus is disp:wt.
+    focus_simple_vars <- intersect(focus_terms, focus_vars)
+
+    keep <- result$Term %in% focus_terms |
+      result$Predictor %in% focus_terms |
+      result$Predictor %in% focus_simple_vars
+
+    if (any(!keep) && length(focus_simple_vars) > 0) {
+      stripped_terms <- gsub("`", "", result$Term, fixed = TRUE)
+      prefix_keep <- Reduce(
+        `|`,
+        lapply(focus_simple_vars, function(v) startsWith(stripped_terms, v)),
+        init = rep(FALSE, nrow(result))
+      )
+      keep <- keep | prefix_keep
+    }
+
+    result <- result[keep, , drop = FALSE]
+  }
+
+  if (nrow(result) == 0) {
+    result <- tibble::tibble(
+      Outcome = outcome,
+      Model = model_label,
+      Status = if (length(focus_terms) > 0) "no_matching_terms" else "no_terms",
+      Error = if (length(focus_terms) > 0) {
+        paste0("No coefficient rows matched `main_independent`: ", paste(focus_terms, collapse = ", "))
+      } else {
+        "No coefficient rows were returned after removing the intercept."
+      },
+      Fit_Warnings = .condition_text_glm_multiple(fit_warnings),
+      Fit_Messages = .condition_text_glm_multiple(fit_messages),
+      Tidy_Warnings = .condition_text_glm_multiple(tidy_try$warnings),
+      Tidy_Messages = .condition_text_glm_multiple(tidy_try$messages)
+    )
+  } else {
+    numeric_cols <- c("Estimate", "SE", "LCL", "UCL", "Statistic")
+    for (nm in intersect(numeric_cols, names(result))) {
+      result[[nm]] <- .format_number_glm_multiple(result[[nm]], num_format)
+    }
+    if ("P" %in% names(result)) result$P <- .format_p_glm_multiple(result$P, p_format)
+  }
+
+  list(
+    table = result,
+    warnings = tidy_try$warnings,
+    messages = tidy_try$messages,
+    error = NULL
+  )
+}
+
+.fit_statistics_glm_multiple <- function(model, outcome, model_label, fit_warnings, fit_messages) {
+  glance_try <- .capture_conditions_glm_multiple(broom::glance(model))
+
+  if (is.null(glance_try$error)) {
+    out <- tibble::as_tibble(glance_try$result)
+  } else {
+    out <- tibble::tibble(Glance_Error = .condition_text_glm_multiple(glance_try$error))
+  }
+
+  nobs_val <- suppressWarnings(tryCatch(stats::nobs(model), error = function(e) NA_integer_))
+  df_resid <- suppressWarnings(tryCatch(stats::df.residual(model), error = function(e) NA_real_))
+  pearson_chisq <- suppressWarnings(tryCatch(sum(stats::residuals(model, type = "pearson")^2, na.rm = TRUE), error = function(e) NA_real_))
+  dispersion <- if (is.finite(df_resid) && df_resid > 0) pearson_chisq / df_resid else NA_real_
+  converged <- if (!is.null(model$converged)) isTRUE(model$converged) else NA
+
+  diag_tbl <- tibble::tibble(
+    Outcome = outcome,
+    Model = model_label,
+    N = nobs_val,
+    DF_Residual = df_resid,
+    Pearson_ChiSq = pearson_chisq,
+    Dispersion = dispersion,
+    Converged = converged
+  )
+
+  out <- dplyr::bind_cols(diag_tbl, out)
+
+  if (requireNamespace("performance", quietly = TRUE)) {
+    perf_try <- .capture_conditions_glm_multiple(performance::performance(model))
+    if (is.null(perf_try$error)) {
+      perf_tbl <- tibble::as_tibble(as.data.frame(perf_try$result))
+      duplicate_cols <- intersect(names(perf_tbl), names(out))
+      if (length(duplicate_cols) > 0) {
+        names(perf_tbl)[match(duplicate_cols, names(perf_tbl))] <- paste0("Performance_", duplicate_cols)
+      }
+      out <- dplyr::bind_cols(out, perf_tbl)
+      perf_error <- "None"
+    } else {
+      perf_error <- .condition_text_glm_multiple(perf_try$error)
+    }
+    perf_warnings <- .condition_text_glm_multiple(perf_try$warnings)
+    perf_messages <- .condition_text_glm_multiple(perf_try$messages)
+  } else {
+    perf_error <- "Package `performance` not installed; skipped performance::performance()."
+    perf_warnings <- "None"
+    perf_messages <- "None"
+  }
+
+  out$Fit_Warnings <- .condition_text_glm_multiple(fit_warnings)
+  out$Fit_Messages <- .condition_text_glm_multiple(fit_messages)
+  out$Glance_Warnings <- .condition_text_glm_multiple(glance_try$warnings)
+  out$Glance_Messages <- .condition_text_glm_multiple(glance_try$messages)
+  out$Performance_Error <- perf_error
+  out$Performance_Warnings <- perf_warnings
+  out$Performance_Messages <- perf_messages
+
+  out
+}
+
+.resolve_marginal_means_glm_multiple <- function(marginal_means, data, rhs_vars, emmeans_at = NULL) {
+  if (is.null(marginal_means) || identical(marginal_means, FALSE)) return(character(0))
+  if (length(marginal_means) == 0) return(character(0))
+
+  if (identical(marginal_means, TRUE)) {
+    is_cat <- vapply(rhs_vars, function(v) {
+      v %in% names(data) && (is.factor(data[[v]]) || is.character(data[[v]]) || is.logical(data[[v]]))
+    }, logical(1))
+    return(rhs_vars[is_cat])
+  }
+
+  if (!is.character(marginal_means)) {
+    stop("`marginal_means` must be FALSE/NULL, TRUE, or a character vector of predictor names.", call. = FALSE)
+  }
+
+  marginal_means <- unique(stats::na.omit(marginal_means))
+  missing <- setdiff(marginal_means, rhs_vars)
+  if (length(missing) > 0) {
+    stop("Variables selected for marginal means are not in the model RHS: ", paste(missing, collapse = ", "), call. = FALSE)
+  }
+
+  numeric_without_at <- marginal_means[vapply(marginal_means, function(v) {
+    is.numeric(data[[v]]) && (is.null(emmeans_at) || !(v %in% names(emmeans_at)))
+  }, logical(1))]
+
+  if (length(numeric_without_at) > 0) {
+    stop(
+      "Numeric marginal means require an `emmeans_at` grid. Problem variable(s): ",
+      paste(numeric_without_at, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  marginal_means
+}
+
+.marginal_means_glm_multiple <- function(model, outcome, model_label, marginal_vars, emmeans_type,
+                                         emmeans_at, pairwise_margins, num_format, p_format) {
+  if (length(marginal_vars) == 0) return(NULL)
+
+  args <- list(object = model, specs = marginal_vars)
+  if (!is.null(emmeans_type)) args$type <- emmeans_type
+  if (!is.null(emmeans_at)) args$at <- emmeans_at
+
+  emm_try <- .capture_conditions_glm_multiple(do.call(emmeans::emmeans, args))
+
+  if (!is.null(emm_try$error)) {
+    return(tibble::tibble(
+      Outcome = outcome,
+      Model = model_label,
+      Component = "estimated_marginal_mean",
+      Error = .condition_text_glm_multiple(emm_try$error),
+      EMM_Warnings = .condition_text_glm_multiple(emm_try$warnings),
+      EMM_Messages = .condition_text_glm_multiple(emm_try$messages)
+    ))
+  }
+
+  emm_df <- tibble::as_tibble(as.data.frame(emm_try$result))
+  emm_df <- dplyr::mutate(
+    emm_df,
+    Outcome = outcome,
+    Model = model_label,
+    Component = "estimated_marginal_mean",
+    .before = 1
+  )
+
+  emm_df$EMM_Warnings <- .condition_text_glm_multiple(emm_try$warnings)
+  emm_df$EMM_Messages <- .condition_text_glm_multiple(emm_try$messages)
+
+  if (isTRUE(pairwise_margins)) {
+    pair_try <- .capture_conditions_glm_multiple(emmeans::pairs(emm_try$result))
+    if (is.null(pair_try$error)) {
+      pair_df <- tibble::as_tibble(as.data.frame(pair_try$result))
+      pair_df <- dplyr::mutate(
+        pair_df,
+        Outcome = outcome,
+        Model = model_label,
+        Component = "pairwise_contrast",
+        .before = 1
+      )
+      pair_df$EMM_Warnings <- .condition_text_glm_multiple(pair_try$warnings)
+      pair_df$EMM_Messages <- .condition_text_glm_multiple(pair_try$messages)
+      emm_df <- dplyr::bind_rows(emm_df, pair_df)
+    } else {
+      emm_df <- dplyr::bind_rows(
+        emm_df,
+        tibble::tibble(
+          Outcome = outcome,
+          Model = model_label,
+          Component = "pairwise_contrast",
+          Error = .condition_text_glm_multiple(pair_try$error),
+          EMM_Warnings = .condition_text_glm_multiple(pair_try$warnings),
+          EMM_Messages = .condition_text_glm_multiple(pair_try$messages)
+        )
+      )
+    }
+  }
+
+  numeric_cols <- names(emm_df)[vapply(emm_df, is.numeric, logical(1))]
+  p_cols <- intersect(c("p.value", "p.value.", "P"), numeric_cols)
+  for (nm in setdiff(numeric_cols, p_cols)) emm_df[[nm]] <- .format_number_glm_multiple(emm_df[[nm]], num_format)
+  for (nm in p_cols) emm_df[[nm]] <- .format_p_glm_multiple(emm_df[[nm]], p_format)
+
+  emm_df
+}
+
+.make_output_path_glm_multiple <- function(outname, output_dir) {
+  if (is.null(outname) || length(outname) == 0 || is.na(outname) || !nzchar(outname)) {
+    prefix <- "Regression_Report"
+    out_dir <- output_dir
+  } else {
+    outname <- tools::file_path_sans_ext(outname)
+    prefix <- basename(outname)
+    out_dir <- dirname(outname)
+    if (identical(out_dir, ".")) out_dir <- output_dir
+  }
+
+  if (is.null(out_dir) || !nzchar(out_dir)) out_dir <- "."
+  dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+  file.path(out_dir, paste0(prefix, "_", Sys.Date(), ".xlsx"))
+}
+
+.empty_tbl_glm_multiple <- function() tibble::tibble()
+
+.sheet_or_note_glm_multiple <- function(x, note) {
+  if (is.null(x) || ncol(x) == 0) return(tibble::tibble(Note = note))
+  x
+}
+
+glm_multiple <- function(data,
+                         dependents,
+                         independents,
+                         distributions = "gaussian",
+                         main_independent = NULL,
+                         focus_outcomes = NULL,
+                         marginal_means = character(0),
+                         fit_statistics = FALSE,
+                         num_format = 0.001,
+                         p_format = num_format,
+                         outname = NULL,
+                         output_dir = ".",
+                         write_files = TRUE,
+                         conf.level = 0.95,
+                         exponentiate = NULL,
+                         emmeans_type = NULL,
+                         emmeans_at = NULL,
+                         pairwise_margins = TRUE,
+                         model_fitters = NULL,
+                         na_action = stats::na.omit,
+                         verbose = TRUE,
+                         ...) {
+  .required_pkgs_glm_multiple(c("broom", "dplyr", "tibble", "scales"))
+  if (isTRUE(write_files)) .required_pkgs_glm_multiple("writexl")
+
+  if (!is.data.frame(data)) stop("`data` must be a data.frame or tibble.", call. = FALSE)
+  if (!is.character(dependents) || length(dependents) == 0) stop("`dependents` must be a non-empty character vector.", call. = FALSE)
+  if (!is.character(independents) || length(independents) == 0) stop("`independents` must be a non-empty character vector.", call. = FALSE)
+  if (!is.numeric(conf.level) || length(conf.level) != 1L || conf.level <= 0 || conf.level >= 1) {
+    stop("`conf.level` must be a single number between 0 and 1.", call. = FALSE)
+  }
+
+  dependents <- unique(dependents)
+  original_specs <- .normalize_specs_glm_multiple(distributions, dependents)
+
+  if (!is.null(focus_outcomes)) {
+    if (!is.character(focus_outcomes)) stop("`focus_outcomes` must be NULL or a character vector of outcomes.", call. = FALSE)
+    missing_focus <- setdiff(focus_outcomes, dependents)
+    if (length(missing_focus) > 0) {
+      stop("`focus_outcomes` contains outcomes not listed in `dependents`: ", paste(missing_focus, collapse = ", "), call. = FALSE)
+    }
+    dependents <- dependents[dependents %in% focus_outcomes]
+  }
+
+  specs <- original_specs[dependents]
+  data_names <- names(data)
+  caller_env <- parent.frame()
+
+  rhs_terms <- vapply(independents, .as_rhs_term_glm_multiple, character(1), data_names = data_names)
+  rhs <- paste(rhs_terms, collapse = " + ")
+  rhs_formula <- stats::as.formula(paste("~", rhs), env = caller_env)
+  rhs_vars <- unique(all.vars(rhs_formula))
+
+  if (length(rhs_vars) == 0) {
+    stop("No usable RHS variables were found in `independents`.", call. = FALSE)
+  }
+
+  missing_rhs_vars <- setdiff(rhs_vars, data_names)
+  if (length(missing_rhs_vars) > 0) {
+    stop("RHS variable(s) not found in `data`: ", paste(missing_rhs_vars, collapse = ", "), call. = FALSE)
+  }
+
+  focus_terms <- unique(stats::na.omit(as.character(main_independent)))
+  focus_terms <- focus_terms[nzchar(focus_terms)]
+  focus_vars <- .vars_from_terms_glm_multiple(focus_terms)
+  missing_focus_vars <- setdiff(focus_vars, rhs_vars)
+  if (length(missing_focus_vars) > 0) {
+    stop(
+      "`main_independent` references variable(s) not found in `independents`: ",
+      paste(missing_focus_vars, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  marginal_vars <- .resolve_marginal_means_glm_multiple(
+    marginal_means = marginal_means,
+    data = data,
+    rhs_vars = rhs_vars,
+    emmeans_at = emmeans_at
+  )
+  if (length(marginal_vars) > 0) .required_pkgs_glm_multiple("emmeans")
+
+  formulas <- lapply(dependents, function(dep) {
+    lhs <- .as_lhs_glm_multiple(dep, data_names)
+    stats::as.formula(paste(lhs, "~", rhs), env = caller_env)
+  })
+  names(formulas) <- dependents
+
+  for (dep in dependents) {
+    formula_vars <- unique(all.vars(formulas[[dep]]))
+    missing_vars <- setdiff(formula_vars, data_names)
+    if (length(missing_vars) > 0) {
+      stop(
+        "Formula for outcome `", dep, "` references variable(s) not found in `data`: ",
+        paste(missing_vars, collapse = ", "),
+        call. = FALSE
+      )
+    }
+  }
+
+  runs <- vector("list", length(dependents))
+  names(runs) <- dependents
+
+  for (i in seq_along(dependents)) {
+    outcome <- dependents[[i]]
+    formula <- formulas[[outcome]]
+    spec <- specs[[outcome]]
+    model_label <- .spec_label_glm_multiple(spec)
+
+    fit_try <- .capture_conditions_glm_multiple(
+      .fit_model_glm_multiple(
+        formula = formula,
+        data = data,
+        spec = spec,
+        na_action = na_action,
+        model_fitters = model_fitters,
+        ...
+      )
+    )
+
+    if (!is.null(fit_try$error)) {
+      result_tbl <- tibble::tibble(
+        Outcome = outcome,
+        Model = model_label,
+        Formula = .formula_text_glm_multiple(formula),
+        Status = "fit_error",
+        Error = .condition_text_glm_multiple(fit_try$error),
+        Fit_Warnings = .condition_text_glm_multiple(fit_try$warnings),
+        Fit_Messages = .condition_text_glm_multiple(fit_try$messages)
+      )
+
+      fit_tbl <- if (isTRUE(fit_statistics)) result_tbl else NULL
+      margin_tbl <- NULL
+
+      log_tbl <- tibble::tibble(
+        Outcome = outcome,
+        Model = model_label,
+        Formula = .formula_text_glm_multiple(formula),
+        Status = "fit_error",
+        Fit_Error = .condition_text_glm_multiple(fit_try$error),
+        Fit_Warnings = .condition_text_glm_multiple(fit_try$warnings),
+        Fit_Messages = .condition_text_glm_multiple(fit_try$messages),
+        Tidy_Error = "Not run",
+        Marginal_Means_Error = if (length(marginal_vars) > 0) "Not run" else "Not requested"
+      )
+
+      runs[[outcome]] <- list(
+        model = NULL,
+        formula = formula,
+        result = result_tbl,
+        fit_statistics = fit_tbl,
+        marginal_means = margin_tbl,
+        log = log_tbl
+      )
+      next
+    }
+
+    model <- fit_try$result
+    exp_flag <- .exponentiate_for_outcome_glm_multiple(exponentiate, outcome, i, model)
+
+    tidy_out <- .tidy_model_glm_multiple(
+      model = model,
+      outcome = outcome,
+      model_label = model_label,
+      focus_terms = focus_terms,
+      focus_vars = focus_vars,
+      fit_warnings = fit_try$warnings,
+      fit_messages = fit_try$messages,
+      conf.level = conf.level,
+      exponentiate = exp_flag,
+      num_format = num_format,
+      p_format = p_format
+    )
+
+    fit_tbl <- NULL
+    if (isTRUE(fit_statistics)) {
+      fit_tbl <- .fit_statistics_glm_multiple(
+        model = model,
+        outcome = outcome,
+        model_label = model_label,
+        fit_warnings = fit_try$warnings,
+        fit_messages = fit_try$messages
+      )
+    }
+
+    margin_tbl <- NULL
+    if (length(marginal_vars) > 0) {
+      margin_tbl <- .marginal_means_glm_multiple(
+        model = model,
+        outcome = outcome,
+        model_label = model_label,
+        marginal_vars = marginal_vars,
+        emmeans_type = emmeans_type,
+        emmeans_at = emmeans_at,
+        pairwise_margins = pairwise_margins,
+        num_format = num_format,
+        p_format = p_format
+      )
+    }
+
+    log_tbl <- tibble::tibble(
+      Outcome = outcome,
+      Model = model_label,
+      Formula = .formula_text_glm_multiple(formula),
+      Status = if (is.null(tidy_out$error)) "ok" else "tidy_error",
+      Fit_Error = "None",
+      Fit_Warnings = .condition_text_glm_multiple(fit_try$warnings),
+      Fit_Messages = .condition_text_glm_multiple(fit_try$messages),
+      Tidy_Error = .condition_text_glm_multiple(tidy_out$error),
+      Tidy_Warnings = .condition_text_glm_multiple(tidy_out$warnings),
+      Tidy_Messages = .condition_text_glm_multiple(tidy_out$messages),
+      Marginal_Means_Error = if (length(marginal_vars) == 0) {
+        "Not requested"
+      } else if (!is.null(margin_tbl) && "Error" %in% names(margin_tbl) && any(!is.na(margin_tbl$Error))) {
+        paste(unique(stats::na.omit(margin_tbl$Error)), collapse = "; ")
+      } else {
+        "None"
+      }
+    )
+
+    runs[[outcome]] <- list(
+      model = model,
+      formula = formula,
+      result = tidy_out$table,
+      fit_statistics = fit_tbl,
+      marginal_means = margin_tbl,
+      log = log_tbl
+    )
+  }
+
+  results_tbl <- dplyr::bind_rows(lapply(runs, `[[`, "result"))
+  fit_tbl <- if (isTRUE(fit_statistics)) dplyr::bind_rows(lapply(runs, `[[`, "fit_statistics")) else .empty_tbl_glm_multiple()
+  margins_tbl <- if (length(marginal_vars) > 0) dplyr::bind_rows(lapply(runs, `[[`, "marginal_means")) else .empty_tbl_glm_multiple()
+  run_log <- dplyr::bind_rows(lapply(runs, `[[`, "log"))
+
+  output_file <- NULL
+  if (isTRUE(write_files)) {
+    output_file <- .make_output_path_glm_multiple(outname, output_dir)
+    sheets <- list(
+      Results = .sheet_or_note_glm_multiple(results_tbl, "No coefficient results were produced."),
+      Fit_Statistics = .sheet_or_note_glm_multiple(fit_tbl, "fit_statistics was FALSE."),
+      Marginal_Means = .sheet_or_note_glm_multiple(margins_tbl, "marginal_means was not requested or produced no rows."),
+      Run_Log = .sheet_or_note_glm_multiple(run_log, "No run log rows were produced.")
+    )
+    writexl::write_xlsx(sheets, path = output_file)
+  }
+
+  out <- list(
+    models = lapply(runs, `[[`, "model"),
+    formulas = lapply(runs, `[[`, "formula"),
+    results = results_tbl,
+    fit_statistics = fit_tbl,
+    marginal_means = margins_tbl,
+    run_log = run_log,
+    output_file = output_file,
+    marginal_variables = marginal_vars,
+    focus_terms = focus_terms
+  )
+  class(out) <- "glm_multiple"
+
+  if (isTRUE(verbose)) print(out)
+  invisible(out)
+}
+
+print.glm_multiple <- function(x, ...) {
+  n_models <- length(x$models)
+  failed <- sum(vapply(x$models, is.null, logical(1)))
+  ok <- n_models - failed
+
+  cat("glm_multiple report\n")
+  cat("Models attempted:", n_models, "\n")
+  cat("Models fitted:", ok, "\n")
+  cat("Model fit failures:", failed, "\n")
+
+  if (length(x$focus_terms) > 0) {
+    cat("Focused coefficient term(s):", paste(x$focus_terms, collapse = ", "), "\n")
+  }
+  if (length(x$marginal_variables) > 0) {
+    cat("Marginal means variable(s):", paste(x$marginal_variables, collapse = ", "), "\n")
+  }
+  if (!is.null(x$output_file)) {
+    cat("Workbook:", x$output_file, "\n")
+  }
+
+  problem_rows <- x$run_log[x$run_log$Status != "ok" | x$run_log$Fit_Warnings != "None" | x$run_log$Tidy_Warnings != "None", , drop = FALSE]
+  if (nrow(problem_rows) > 0) {
+    cat("\nIssues detected; inspect `run_log` for details.\n")
+    print(problem_rows[, intersect(c("Outcome", "Model", "Status", "Fit_Error", "Fit_Warnings", "Tidy_Error", "Tidy_Warnings"), names(problem_rows)), drop = FALSE])
+  }
+
+  invisible(x)
+}

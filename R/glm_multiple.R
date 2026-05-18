@@ -1,20 +1,6 @@
-data(mtcars)
-librarian::shelf(tidyverse, broom, broom.helpers, scales, writexl)
-
-data = mtcars %>%
-    mutate(test = factor(rep(0:1, 16)),
-        vs = as.factor(vs),
-        gear = as.factor(vs),
-        carb = as.factor(carb))
-dependents = c("mpg", "cyl")
-independents = c("disp", "hp", "drat", "wt", "qsec", "carb", "gear")
-distributions = c("gaussian", "poisson")
-main_independent = NULL
-fit_statistics = T
-marginal_means = c("carb", "gear")
-outname = NULL
-
 glm_multiple <- function(data, dependents, independents, main_independent = NULL, distributions, marginal_means = character(0), fit_statistics = F, num_format = 0.001, p_format = num_format, outname = NULL) {
+    librarian::shelf(tidyverse, broom, broom.helpers, scales, writexl)
+    
     if(!require("librarian")){
         install.packages("librarian")
     } else {
@@ -140,14 +126,3 @@ glm_multiple <- function(data, dependents, independents, main_independent = NULL
             write_xlsx(path = sprintf("%sRegression margins %s.xlsx", if(length(outname) == 0) "" else paste0(outname, " "), Sys.Date()))
     }
 }
-
-glm_multiple(
-    data = data, 
-    dependents = c("mpg", "cyl"),
-    independents = c("disp", "hp", "drat", "wt", "qsec", "vs", "disp*wt"), 
-    # main_independent = "disp:wt",
-    distributions = c("gaussian", "poisson"),
-    marginal_means = T,
-    fit_statistics = T,
-    outname = "Test"
-    )
